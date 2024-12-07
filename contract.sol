@@ -9,7 +9,7 @@ interface IERC721Enumerable {
 contract MonthlyWithdrawal {
     // Constants
     IERC721Enumerable public constant MOONSHOTBOT_CONTRACT = IERC721Enumerable(0x8b13e88EAd7EF8075b58c94a7EB18A89FD729B18);
-    address public constant INITIAL_ADMIN = 0x4B20993Bc481177ec7E8f571ceCaE8A9e22C02db;
+    address public constant INITIAL_ADMIN = 0x00De4B13153673BCAE2616b67bf822500d325Fc3;
     uint256 public constant WITHDRAWAL_AMOUNT = 0.1 ether;
     uint256 public constant TIME_INTERVAL = 30 days;
     // uint256 public constant TIME_INTERVAL = 10 minutes; // For testing
