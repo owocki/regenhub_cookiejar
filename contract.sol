@@ -76,11 +76,12 @@ contract MonthlyWithdrawal {
     }
 
     modifier onlyAllowed() {
-        if (!isAllowedMember[msg.sender] && MOONSHOTBOT_CONTRACT.balanceOf(msg.sender) == 0) {
-            if (!isAllowedMember[msg.sender]) {
-                revert NotAllowedError(msg.sender, "Address is not in the whitelist");
+        // Check if they're either not whitelisted OR they have NFTs
+        if (!isAllowedMember[msg.sender] || MOONSHOTBOT_CONTRACT.balanceOf(msg.sender) > 0) {
+            if (MOONSHOTBOT_CONTRACT.balanceOf(msg.sender) > 0) {
+                revert NotAllowedError(msg.sender, "NFT holders cannot use whitelist withdrawal");
             } else {
-                revert NotAllowedError(msg.sender, "Address does not hold any Moonshotbot NFTs");
+                revert NotAllowedError(msg.sender, "Address is not in the whitelist");
             }
         }
         _;
@@ -233,6 +234,7 @@ contract MonthlyWithdrawal {
         if (!success) revert TransferFailed(msg.sender, WITHDRAWAL_AMOUNT);
     }
 
+    /// @notice Allows whitelisted members (who don't own any NFTs) to withdraw
     function withdrawAsWhitelisted(string memory note) external 
         nonReentrant
         whenNotPaused 
