@@ -21,21 +21,23 @@ contract MonthlyWithdrawal {
     error NFTError(string reason);
     error InsufficientBalance(uint256 available, uint256 required);
     error TimeIntervalError(uint256 remainingTime);
+    error BatchSizeError(string reason);
 
-    // Constants
-    IERC721Enumerable public constant MOONSHOTBOT_CONTRACT = IERC721Enumerable(0x8b13e88EAd7EF8075b58c94a7EB18A89FD729B18);
-    address public constant INITIAL_ADMIN = 0x5B38Da6a701c568545dCfcB03FcB875f56beddC4;
+    // Constants made immutable for gas optimization
+    IERC721Enumerable public immutable MOONSHOTBOT_CONTRACT;
+    address public immutable INITIAL_ADMIN;
     uint256 public constant WITHDRAWAL_AMOUNT = 100000000000000000; // 0.1 ether in wei
     uint256 public constant TIME_INTERVAL = 30 days;
+    uint256 public constant MAX_BATCH_SIZE = 50;
 
     // State variables
     mapping(address => bool) public isAdmin;
     mapping(uint256 => uint256) public lastWithdrawalTimeByNFT;
     mapping(address => uint256) public lastWithdrawalTime;
-    mapping(address => bool) public isAllowedMember;
+    mapping(address => bool) public isAllowedMember; // Replaced array with mapping
     bool public isPaused;
     
-    // Reentrancy Guard
+    // Reentrancy Guard using a more gas-efficient uint256
     uint256 private _notEntered = 1;
 
     // Events
@@ -46,10 +48,18 @@ contract MonthlyWithdrawal {
     event MemberRemoved(address indexed member);
     event PauseStateChanged(address indexed admin, bool isPaused);
     event EmergencyWithdrawal(address indexed admin, uint256 amount);
+    event ContractInitialized(address moonshotContract, address initialAdmin);
 
-    // Constructor
-    constructor() {
+    // Constructor to initialize immutable variables
+    constructor(address moonshotbotContract, address initialAdmin) {
+        if (moonshotbotContract == address(0)) revert InvalidAddress("Moonshotbot contract address cannot be zero");
+        if (initialAdmin == address(0)) revert InvalidAddress("Initial admin address cannot be zero");
+
+        MOONSHOTBOT_CONTRACT = IERC721Enumerable(moonshotbotContract);
+        INITIAL_ADMIN = initialAdmin;
         isAdmin[INITIAL_ADMIN] = true;
+
+        emit ContractInitialized(moonshotbotContract, initialAdmin);
     }
 
     // Modifiers
@@ -105,7 +115,7 @@ contract MonthlyWithdrawal {
         emit AdminRemoved(admin);
     }
 
-    // Member management
+    // Member management - Gas optimized with mapping
     function addMember(address newMember) external onlyAdmin {
         if (newMember == address(0)) revert InvalidAddress("Member address cannot be zero");
         if (isAllowedMember[newMember]) revert MemberError("Address is already a member");
@@ -127,25 +137,38 @@ contract MonthlyWithdrawal {
         emit PauseStateChanged(msg.sender, _isPaused);
     }
 
-    // Emergency withdrawal
+    // Emergency withdrawal with reentrancy protection
     function emergencyWithdrawAll() external nonReentrant onlyAdmin {
         uint256 balance = address(this).balance;
         if (balance == 0) revert InsufficientBalance(0, 1);
         
-        address payable receiver = payable(msg.sender);
-        (bool success, ) = receiver.call{value: balance}("");
-        if (!success) revert TransferFailed(msg.sender, balance);
-        
+        // Update state before transfer (even though there's no state to update, keeping pattern consistent)
         emit EmergencyWithdrawal(msg.sender, balance);
+        
+        // Transfer funds last
+        (bool success, ) = payable(msg.sender).call{value: balance}("");
+        if (!success) revert TransferFailed(msg.sender, balance);
     }
 
-    // View functions
-    function getNFTsForAddress(address user) public view returns (uint256[] memory) {
+    // View functions with batch processing
+    function getNFTsForAddress(address user, uint256 startIndex, uint256 batchSize) 
+        public 
+        view 
+        returns (uint256[] memory) 
+    {
         uint256 balance = MOONSHOTBOT_CONTRACT.balanceOf(user);
-        uint256[] memory tokens = new uint256[](balance);
+        if (startIndex >= balance) revert BatchSizeError("Start index out of bounds");
+        if (batchSize > MAX_BATCH_SIZE) revert BatchSizeError("Batch size too large");
         
-        for(uint256 i = 0; i < balance; i++) {
-            tokens[i] = MOONSHOTBOT_CONTRACT.tokenOfOwnerByIndex(user, i);
+        uint256 endIndex = startIndex + batchSize;
+        if (endIndex > balance) {
+            endIndex = balance;
+        }
+        uint256 actualBatchSize = endIndex - startIndex;
+        
+        uint256[] memory tokens = new uint256[](actualBatchSize);
+        for(uint256 i = 0; i < actualBatchSize; i++) {
+            tokens[i] = MOONSHOTBOT_CONTRACT.tokenOfOwnerByIndex(user, startIndex + i);
         }
         
         return tokens;
@@ -173,7 +196,7 @@ contract MonthlyWithdrawal {
         return address(this).balance;
     }
 
-    // Withdrawal functions
+    // Withdrawal functions with strict Checks-Effects-Interactions pattern
     function withdrawWithNFT(string memory note, uint256 tokenId) external 
         nonReentrant
         whenNotPaused 
@@ -202,12 +225,12 @@ contract MonthlyWithdrawal {
         // Update state before transfer
         lastWithdrawalTimeByNFT[tokenId] = block.timestamp;
         
-        // Transfer funds
-        address payable receiver = payable(msg.sender);
-        (bool success, ) = receiver.call{value: WITHDRAWAL_AMOUNT}("");
-        if (!success) revert TransferFailed(msg.sender, WITHDRAWAL_AMOUNT);
-        
+        // Emit event before transfer
         emit Withdrawal(msg.sender, WITHDRAWAL_AMOUNT, note, tokenId);
+        
+        // Transfer funds last
+        (bool success, ) = payable(msg.sender).call{value: WITHDRAWAL_AMOUNT}("");
+        if (!success) revert TransferFailed(msg.sender, WITHDRAWAL_AMOUNT);
     }
 
     function withdrawAsWhitelisted(string memory note) external 
@@ -228,12 +251,12 @@ contract MonthlyWithdrawal {
         // Update state before transfer
         lastWithdrawalTime[msg.sender] = block.timestamp;
         
-        // Transfer funds
-        address payable receiver = payable(msg.sender);
-        (bool success, ) = receiver.call{value: WITHDRAWAL_AMOUNT}("");
-        if (!success) revert TransferFailed(msg.sender, WITHDRAWAL_AMOUNT);
-        
+        // Emit event before transfer
         emit Withdrawal(msg.sender, WITHDRAWAL_AMOUNT, note, 0);
+        
+        // Transfer funds last
+        (bool success, ) = payable(msg.sender).call{value: WITHDRAWAL_AMOUNT}("");
+        if (!success) revert TransferFailed(msg.sender, WITHDRAWAL_AMOUNT);
     }
 
     // Receive and fallback functions
