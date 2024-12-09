@@ -22,6 +22,8 @@ contract MonthlyWithdrawal {
     error InsufficientBalance(uint256 available, uint256 required);
     error TimeIntervalError(uint256 remainingTime);
     error BatchSizeError(string reason);
+    error InvalidContract(address contract_);
+    error InvalidNote(string reason);
 
     // Constants made immutable for gas optimization
     IERC721Enumerable public immutable MOONSHOTBOT_CONTRACT;
@@ -29,12 +31,13 @@ contract MonthlyWithdrawal {
     uint256 public constant WITHDRAWAL_AMOUNT = 100000000000000000; // 0.1 ether in wei
     uint256 public constant TIME_INTERVAL = 30 days;
     uint256 public constant MAX_BATCH_SIZE = 50;
+    uint256 public constant MAX_NOTE_LENGTH = 1000;
 
     // State variables
     mapping(address => bool) public isAdmin;
     mapping(uint256 => uint256) public lastWithdrawalTimeByNFT;
     mapping(address => uint256) public lastWithdrawalTime;
-    mapping(address => bool) public isAllowedMember; // Replaced array with mapping
+    mapping(address => bool) public isAllowedMember;
     bool public isPaused;
     
     // Reentrancy Guard using a more gas-efficient uint256
@@ -50,10 +53,16 @@ contract MonthlyWithdrawal {
     event EmergencyWithdrawal(address indexed admin, uint256 amount);
     event ContractInitialized(address moonshotContract, address initialAdmin);
 
-    // Constructor to initialize immutable variables
     constructor(address moonshotbotContract, address initialAdmin) {
         if (moonshotbotContract == address(0)) revert InvalidAddress("Moonshotbot contract address cannot be zero");
         if (initialAdmin == address(0)) revert InvalidAddress("Initial admin address cannot be zero");
+
+        // Verify contract address has code
+        uint256 size;
+        assembly {
+            size := extcodesize(moonshotbotContract)
+        }
+        if (size == 0) revert InvalidContract(moonshotbotContract);
 
         MOONSHOTBOT_CONTRACT = IERC721Enumerable(moonshotbotContract);
         INITIAL_ADMIN = initialAdmin;
@@ -75,22 +84,10 @@ contract MonthlyWithdrawal {
         _;
     }
 
-    modifier onlyAllowed() {
-        // Check if they're either not whitelisted OR they have NFTs
-        if (!isAllowedMember[msg.sender] || MOONSHOTBOT_CONTRACT.balanceOf(msg.sender) > 0) {
-            if (MOONSHOTBOT_CONTRACT.balanceOf(msg.sender) > 0) {
-                revert NotAllowedError(msg.sender, "NFT holders cannot use whitelist withdrawal");
-            } else {
-                revert NotAllowedError(msg.sender, "Address is not in the whitelist");
-            }
-        }
-        _;
-    }
-
     modifier validNoteLength(string memory note) {
-        if (bytes(note).length < 20) {
-            revert InvalidNoteLength(bytes(note).length, 20);
-        }
+        uint256 length = bytes(note).length;
+        if (length < 20) revert InvalidNoteLength(length, 20);
+        if (length > MAX_NOTE_LENGTH) revert InvalidNote("Note too long");
         _;
     }
 
@@ -116,7 +113,7 @@ contract MonthlyWithdrawal {
         emit AdminRemoved(admin);
     }
 
-    // Member management - Gas optimized with mapping
+    // Member management
     function addMember(address newMember) external onlyAdmin {
         if (newMember == address(0)) revert InvalidAddress("Member address cannot be zero");
         if (isAllowedMember[newMember]) revert MemberError("Address is already a member");
@@ -138,20 +135,17 @@ contract MonthlyWithdrawal {
         emit PauseStateChanged(msg.sender, _isPaused);
     }
 
-    // Emergency withdrawal with reentrancy protection
     function emergencyWithdrawAll() external nonReentrant onlyAdmin {
         uint256 balance = address(this).balance;
         if (balance == 0) revert InsufficientBalance(0, 1);
         
-        // Update state before transfer (even though there's no state to update, keeping pattern consistent)
         emit EmergencyWithdrawal(msg.sender, balance);
         
-        // Transfer funds last
         (bool success, ) = payable(msg.sender).call{value: balance}("");
         if (!success) revert TransferFailed(msg.sender, balance);
     }
 
-    // View functions with batch processing
+    // View functions
     function getNFTsForAddress(address user, uint256 startIndex, uint256 batchSize) 
         public 
         view 
@@ -197,7 +191,7 @@ contract MonthlyWithdrawal {
         return address(this).balance;
     }
 
-    // Withdrawal functions with strict Checks-Effects-Interactions pattern
+    // Withdrawal functions
     function withdrawWithNFT(string memory note, uint256 tokenId) external 
         nonReentrant
         whenNotPaused 
@@ -212,7 +206,6 @@ contract MonthlyWithdrawal {
             revert TimeIntervalError(remainingTime);
         }
         
-        // Verify NFT ownership
         uint256 balance = MOONSHOTBOT_CONTRACT.balanceOf(msg.sender);
         bool ownsToken = false;
         for(uint256 i = 0; i < balance; i++) {
@@ -223,40 +216,38 @@ contract MonthlyWithdrawal {
         }
         if (!ownsToken) revert NFTError("You don't own this NFT token");
         
-        // Update state before transfer
         lastWithdrawalTimeByNFT[tokenId] = block.timestamp;
         
-        // Emit event before transfer
         emit Withdrawal(msg.sender, WITHDRAWAL_AMOUNT, note, tokenId);
         
-        // Transfer funds last
         (bool success, ) = payable(msg.sender).call{value: WITHDRAWAL_AMOUNT}("");
         if (!success) revert TransferFailed(msg.sender, WITHDRAWAL_AMOUNT);
     }
 
-    /// @notice Allows whitelisted members (who don't own any NFTs) to withdraw
     function withdrawAsWhitelisted(string memory note) external 
         nonReentrant
         whenNotPaused 
-        onlyAllowed 
         validNoteLength(note) 
     {
+        // Check whitelist status and NFT balance
+        if (!isAllowedMember[msg.sender]) revert NotAllowedError(msg.sender, "Not whitelisted");
+        if (MOONSHOTBOT_CONTRACT.balanceOf(msg.sender) > 0) revert NotAllowedError(msg.sender, "NFT holders cannot withdraw");
+        
+        // Check contract balance
         if (address(this).balance < WITHDRAWAL_AMOUNT) {
             revert InsufficientBalance(address(this).balance, WITHDRAWAL_AMOUNT);
         }
         
+        // Check time interval
         if (block.timestamp < lastWithdrawalTime[msg.sender] + TIME_INTERVAL) {
             uint256 remainingTime = (lastWithdrawalTime[msg.sender] + TIME_INTERVAL) - block.timestamp;
             revert TimeIntervalError(remainingTime);
         }
         
-        // Update state before transfer
         lastWithdrawalTime[msg.sender] = block.timestamp;
         
-        // Emit event before transfer
         emit Withdrawal(msg.sender, WITHDRAWAL_AMOUNT, note, 0);
         
-        // Transfer funds last
         (bool success, ) = payable(msg.sender).call{value: WITHDRAWAL_AMOUNT}("");
         if (!success) revert TransferFailed(msg.sender, WITHDRAWAL_AMOUNT);
     }
