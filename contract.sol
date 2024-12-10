@@ -1,116 +1,274 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-contract MonthlyWithdrawal {
-    address public initialAdmin = 0x00De4B13153673BCAE2616b67bf822500d325Fc3;
-    mapping(address => bool) public isAdmin;
-    address[] public allowedAddresses;
-    mapping(address => uint256) public lastWithdrawalTime;
+interface IERC721Enumerable {
+    function balanceOf(address owner) external view returns (uint256);
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+}
 
-    uint256 public constant WITHDRAWAL_AMOUNT = 0.1 ether;
+contract CookieJar {
+    // Error messages
+    error NotAdminError(address caller);
+    error NotAllowedError(address caller, string reason);
+    error InvalidNoteLength(uint256 length, uint256 required);
+    error ContractIsPaused();
+    error ReentrantCall();
+    error InvalidAddress(string reason);
+    error AdminError(string reason);
+    error MemberError(string reason);
+    error WithdrawalError(string reason);
+    error TransferFailed(address to, uint256 amount);
+    error NFTError(string reason);
+    error InsufficientBalance(uint256 available, uint256 required);
+    error TimeIntervalError(uint256 remainingTime);
+    error BatchSizeError(string reason);
+    error InvalidContract(address contract_);
+    error InvalidNote(string reason);
+
+    // Constants made immutable for gas optimization
+    IERC721Enumerable public immutable MOONSHOTBOT_CONTRACT;
+    address public immutable INITIAL_ADMIN;
+    uint256 public NFT_WITHDRAWAL_AMOUNT = 6500000000000000; // 0.0065 ether in wei
+    uint256 public WHITELIST_WITHDRAWAL_AMOUNT = 6500000000000000; // 0.0065 ether in wei
     uint256 public constant TIME_INTERVAL = 30 days;
+    uint256 public constant MAX_BATCH_SIZE = 50;
+    uint256 public constant MAX_NOTE_LENGTH = 1000;
 
-    event Withdrawal(address indexed user, uint256 amount, string note);
+    // State variables
+    mapping(address => bool) public isAdmin;
+    mapping(uint256 => uint256) public lastWithdrawalTimeByNFT;
+    mapping(address => uint256) public lastWithdrawalTime;
+    mapping(address => bool) public isAllowedMember;
+    bool public isPaused;
+    
+    // Reentrancy Guard using a more gas-efficient uint256
+    uint256 private _notEntered = 1;
+
+    // Events
+    event Withdrawal(address indexed user, uint256 amount, string note, uint256 indexed tokenId);
     event AdminAdded(address indexed newAdmin);
     event AdminRemoved(address indexed admin);
     event MemberAdded(address indexed member);
     event MemberRemoved(address indexed member);
+    event PauseStateChanged(address indexed admin, bool isPaused);
+    event EmergencyWithdrawal(address indexed admin, uint256 amount);
+    event ContractInitialized(address moonshotContract, address initialAdmin);
+    event NFTWithdrawalAmountUpdated(uint256 newAmount);
+    event WhitelistWithdrawalAmountUpdated(uint256 newAmount);
+
+    constructor(address moonshotbotContract, address initialAdmin) {
+        if (moonshotbotContract == address(0)) revert InvalidAddress("Moonshotbot contract address cannot be zero");
+        if (initialAdmin == address(0)) revert InvalidAddress("Initial admin address cannot be zero");
+
+        // Verify contract address has code
+        uint256 size;
+        assembly {
+            size := extcodesize(moonshotbotContract)
+        }
+        if (size == 0) revert InvalidContract(moonshotbotContract);
+
+        MOONSHOTBOT_CONTRACT = IERC721Enumerable(moonshotbotContract);
+        INITIAL_ADMIN = initialAdmin;
+        isAdmin[INITIAL_ADMIN] = true;
+
+        emit ContractInitialized(moonshotbotContract, initialAdmin);
+    }
+
+    // Modifiers
+    modifier nonReentrant() {
+        if (_notEntered != 1) revert ReentrantCall();
+        _notEntered = 2;
+        _;
+        _notEntered = 1;
+    }
 
     modifier onlyAdmin() {
-        require(isAdmin[msg.sender], "Not an admin");
-        _;
-    }
-
-    modifier onlyAllowed() {
-        require(isAllowed(msg.sender), "Not allowed to withdraw");
-        _;
-    }
-
-    modifier canWithdraw() {
-        require(block.timestamp >= lastWithdrawalTime[msg.sender] + TIME_INTERVAL, "Withdrawal not allowed yet");
+        if (!isAdmin[msg.sender]) revert NotAdminError(msg.sender);
         _;
     }
 
     modifier validNoteLength(string memory note) {
-        require(bytes(note).length >= 20, "Note must be at least 20 characters long");
+        uint256 length = bytes(note).length;
+        if (length < 20) revert InvalidNoteLength(length, 20);
+        if (length > MAX_NOTE_LENGTH) revert InvalidNote("Note too long");
         _;
     }
 
-    constructor() {
-        isAdmin[initialAdmin] = true;
-        allowedAddresses.push(0xb48E8dA63c2aFc5633702B7acf4BDe830c1dE48b);
-        allowedAddresses.push(0x1d671d1B191323A38490972D58354971E5c1cd2A);
-        allowedAddresses.push(0x7d03C5c37f77Fd01211334B9115CA108C84E8f3B);
-        allowedAddresses.push(0x00De4B13153673BCAE2616b67bf822500d325Fc3);
-        allowedAddresses.push(0x1dCD8763c01961C2BbB5ed58C6E51F55b1378589);
-        allowedAddresses.push(0x890154e4179452858EEa60ed81B8E366010D0b8E);
-        allowedAddresses.push(0x7a738EfFD10bF108b7617Ec8E96a0722fa54C547);
+    modifier whenNotPaused() {
+        if (isPaused) revert ContractIsPaused();
+        _;
     }
 
-    // Admin functions
+    // Admin management
     function addAdmin(address newAdmin) external onlyAdmin {
-        require(!isAdmin[newAdmin], "Already an admin");
+        if (newAdmin == address(0)) revert InvalidAddress("Admin address cannot be zero");
+        if (isAdmin[newAdmin]) revert AdminError("Address is already an admin");
+        
         isAdmin[newAdmin] = true;
         emit AdminAdded(newAdmin);
     }
 
     function removeAdmin(address admin) external onlyAdmin {
-        require(isAdmin[admin], "Not an admin");
+        if (admin == INITIAL_ADMIN) revert AdminError("Cannot remove initial admin");
+        if (!isAdmin[admin]) revert AdminError("Address is not an admin");
+        
         isAdmin[admin] = false;
         emit AdminRemoved(admin);
     }
 
-    // Manage allowed addresses
-    function addMember(address newMember) external onlyAdmin {
-        require(!isAllowed(newMember), "Already a member");
-        allowedAddresses.push(newMember);
-        emit MemberAdded(newMember);
+    // Update withdrawal amounts
+    function updateNFTWithdrawalAmount(uint256 newAmount) external onlyAdmin {
+        NFT_WITHDRAWAL_AMOUNT = newAmount;
+        emit NFTWithdrawalAmountUpdated(newAmount);
+    }
+
+    function updateWhitelistWithdrawalAmount(uint256 newAmount) external onlyAdmin {
+        WHITELIST_WITHDRAWAL_AMOUNT = newAmount;
+        emit WhitelistWithdrawalAmountUpdated(newAmount);
+    }
+
+    // Member management
+    function addMembers(address[] calldata newMembers) external onlyAdmin {
+        for (uint256 i = 0; i < newMembers.length; i++) {
+            address newMember = newMembers[i];
+            if (newMember == address(0)) revert InvalidAddress("Member address cannot be zero");
+            if (isAllowedMember[newMember]) revert MemberError("Address is already a member");
+            
+            isAllowedMember[newMember] = true;
+            emit MemberAdded(newMember);
+        }
     }
 
     function removeMember(address member) external onlyAdmin {
-        require(isAllowed(member), "Not a member");
-        for (uint256 i = 0; i < allowedAddresses.length; i++) {
-            if (allowedAddresses[i] == member) {
-                allowedAddresses[i] = allowedAddresses[allowedAddresses.length - 1];
-                allowedAddresses.pop();
-                emit MemberRemoved(member);
-                return;
-            }
+        if (!isAllowedMember[member]) revert MemberError("Address is not a member");
+        
+        isAllowedMember[member] = false;
+        emit MemberRemoved(member);
+    }
+
+    // Emergency controls
+    function setPaused(bool _isPaused) external onlyAdmin {
+        isPaused = _isPaused;
+        emit PauseStateChanged(msg.sender, _isPaused);
+    }
+
+    function emergencyWithdrawAll() external nonReentrant onlyAdmin {
+        uint256 balance = address(this).balance;
+        if (balance == 0) revert InsufficientBalance(0, 1);
+        
+        emit EmergencyWithdrawal(msg.sender, balance);
+        
+        (bool success, ) = payable(msg.sender).call{value: balance}("");
+        if (!success) revert TransferFailed(msg.sender, balance);
+    }
+
+    // View functions
+    function getNFTsForAddress(address user, uint256 startIndex, uint256 batchSize) 
+        public 
+        view 
+        returns (uint256[] memory) 
+    {
+        uint256 balance = MOONSHOTBOT_CONTRACT.balanceOf(user);
+        if (startIndex >= balance) revert BatchSizeError("Start index out of bounds");
+        if (batchSize > MAX_BATCH_SIZE) revert BatchSizeError("Batch size too large");
+        
+        uint256 endIndex = startIndex + batchSize;
+        if (endIndex > balance) {
+            endIndex = balance;
         }
-    }
-
-    // Check if the address is in the allowed list
-    function isAllowed(address user) public view returns (bool) {
-        for (uint256 i = 0; i < allowedAddresses.length; i++) {
-            if (allowedAddresses[i] == user) {
-                return true;
-            }
+        uint256 actualBatchSize = endIndex - startIndex;
+        
+        uint256[] memory tokens = new uint256[](actualBatchSize);
+        for(uint256 i = 0; i < actualBatchSize; i++) {
+            tokens[i] = MOONSHOTBOT_CONTRACT.tokenOfOwnerByIndex(user, startIndex + i);
         }
-        return false;
+        
+        return tokens;
     }
 
-    // Withdraw function with note requirement
-    function withdraw(string memory note) external onlyAllowed canWithdraw validNoteLength(note) {
-        require(address(this).balance >= WITHDRAWAL_AMOUNT, "Insufficient contract balance");
-
-        lastWithdrawalTime[msg.sender] = block.timestamp;
-        payable(msg.sender).transfer(WITHDRAWAL_AMOUNT);
-
-        emit Withdrawal(msg.sender, WITHDRAWAL_AMOUNT, note);
+    function canNFTWithdraw(uint256 tokenId) public view returns (bool) {
+        return block.timestamp >= lastWithdrawalTimeByNFT[tokenId] + TIME_INTERVAL;
     }
 
-    // Receive ETH to the contract
-    receive() external payable {}
+    function getRemainingTimeForNFT(uint256 tokenId) external view returns (uint256) {
+        if (block.timestamp >= lastWithdrawalTimeByNFT[tokenId] + TIME_INTERVAL) {
+            return 0;
+        }
+        return (lastWithdrawalTimeByNFT[tokenId] + TIME_INTERVAL) - block.timestamp;
+    }
 
-    // Fallback function for receiving ETH
-    fallback() external payable {}
-
-    // Get the remaining time until the next withdrawal
     function getRemainingTime() external view returns (uint256) {
         if (block.timestamp >= lastWithdrawalTime[msg.sender] + TIME_INTERVAL) {
             return 0;
-        } else {
-            return (lastWithdrawalTime[msg.sender] + TIME_INTERVAL) - block.timestamp;
+        }
+        return (lastWithdrawalTime[msg.sender] + TIME_INTERVAL) - block.timestamp;
+    }
+
+    function getContractBalance() public view returns (uint256) {
+        return address(this).balance;
+    }
+
+    // Withdrawal functions
+    function withdrawWithNFT(string memory note, uint256 tokenId) external 
+    nonReentrant
+    whenNotPaused 
+    validNoteLength(note) {
+    if (address(this).balance < NFT_WITHDRAWAL_AMOUNT) {
+        revert InsufficientBalance(address(this).balance, NFT_WITHDRAWAL_AMOUNT);
+    }
+    
+    uint256 balance = MOONSHOTBOT_CONTRACT.balanceOf(msg.sender);
+    bool ownsToken = false;
+    for(uint256 i = 0; i < balance; i++) {
+        if(MOONSHOTBOT_CONTRACT.tokenOfOwnerByIndex(msg.sender, i) == tokenId) {
+            ownsToken = true;
+            break;
         }
     }
+    if (!ownsToken) revert NFTError("You don't own this NFT token");
+    
+    if (!canNFTWithdraw(tokenId)) {
+        uint256 remainingTime = (lastWithdrawalTimeByNFT[tokenId] + TIME_INTERVAL) - block.timestamp;
+        revert TimeIntervalError(remainingTime);
+    }
+        
+        lastWithdrawalTimeByNFT[tokenId] = block.timestamp;
+        
+        emit Withdrawal(msg.sender, NFT_WITHDRAWAL_AMOUNT, note, tokenId);
+        
+        (bool success, ) = payable(msg.sender).call{value: NFT_WITHDRAWAL_AMOUNT}("");
+        if (!success) revert TransferFailed(msg.sender, NFT_WITHDRAWAL_AMOUNT);
+    }
+
+    function withdrawAsWhitelisted(string memory note) external 
+        nonReentrant
+        whenNotPaused 
+        validNoteLength(note) 
+    {
+        // Check whitelist status and NFT balance
+        if (!isAllowedMember[msg.sender]) revert NotAllowedError(msg.sender, "Not whitelisted");
+        if (MOONSHOTBOT_CONTRACT.balanceOf(msg.sender) > 0) revert NotAllowedError(msg.sender, "NFT holders cannot withdraw");
+        
+        // Check contract balance
+        if (address(this).balance < WHITELIST_WITHDRAWAL_AMOUNT) {
+            revert InsufficientBalance(address(this).balance, WHITELIST_WITHDRAWAL_AMOUNT);
+        }
+        
+        // Check time interval
+        if (block.timestamp < lastWithdrawalTime[msg.sender] + TIME_INTERVAL) {
+            uint256 remainingTime = (lastWithdrawalTime[msg.sender] + TIME_INTERVAL) - block.timestamp;
+            revert TimeIntervalError(remainingTime);
+        }
+        
+        lastWithdrawalTime[msg.sender] = block.timestamp;
+        
+        emit Withdrawal(msg.sender, WHITELIST_WITHDRAWAL_AMOUNT, note, 0);
+        
+        (bool success, ) = payable(msg.sender).call{value: WHITELIST_WITHDRAWAL_AMOUNT}("");
+        if (!success) revert TransferFailed(msg.sender, WHITELIST_WITHDRAWAL_AMOUNT);
+    }
+
+    // Receive and fallback functions
+    receive() external payable {}
+    fallback() external payable {}
 }
